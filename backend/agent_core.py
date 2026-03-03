@@ -1,4 +1,8 @@
 import os
+
+# 🚨 [중요] Mac 환경에서 Segmentation Fault 방지를 위해 최상단에 배치
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import json
 import numpy as np
 import mysql.connector
@@ -6,9 +10,13 @@ import warnings
 import ssl
 import urllib.parse
 import unicodedata
+import threading  # 🚨 동기화 Lock을 위해 추가
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
+
+# LangChain 관련 임포트
+from langchain_core.runnables import RunnableParallel, RunnableLambda
 
 # 1. 환경 변수 로드
 load_dotenv()
@@ -24,6 +32,10 @@ from sentence_transformers import SentenceTransformer
 # 경고 무시
 warnings.filterwarnings("ignore")
 
+# 🚨 [해결책] 임베딩 모델 충돌 방지용 Lock 선언
+# 여러 스레드가 동시에 embed_model을 호출하지 못하도록 순서를 정해줍니다.
+embedding_lock = threading.Lock()
+
 # 2. 설정값
 MODEL_NAME = os.getenv("LLM_MODEL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
@@ -36,7 +48,6 @@ DB_CONFIG = {
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
 BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:3000/sources/")
 
-# 💡 [핵심] 세션별 대화 기록을 저장할 메모리 저장소
 chat_histories = {}
 
 # 3. 모델 로드
@@ -45,26 +56,36 @@ embed_model = SentenceTransformer('BAAI/bge-m3')
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0)
 print(f"✅ [System] 로드 완료.")
 
-def classify_intent(query: str, history_text: str = "") -> str:
-    """의도 분석: 맥락을 포함하여 CHAT 또는 INFO 판별"""
+# --- 핵심 로직 ---
+
+def analyze_request(query: str, history_text: str = ""):
+    """의도 분류와 질문 분해"""
+    prompt = (
+        f"이전 대화 맥락:\n{history_text}\n\n"
+        f"사용자 질문: '{query}'\n\n"
+        "당신은 분석 에이전트입니다. 반드시 JSON 형식으로만 답변하세요. 예: {\"intent\": \"INFO\", \"keywords\": [\"키워드1\"]}"
+    )
     try:
-        prompt = (
-            f"이전 대화 맥락:\n{history_text}\n\n"
-            f"사용자의 마지막 질문: '{query}'\n"
-            f"이 질문의 의도가 정보 검색(INFO)인지 일반 대화(CHAT)인지 판단하세요. "
-            f"오직 'CHAT' 또는 'INFO'라고만 한 단어로 답변하세요."
-        )
-        response = llm.invoke(prompt).strip().upper()
-        return "INFO" if "INFO" in response else "CHAT"
+        res = llm.invoke(prompt).strip()
+        clean_res = res.replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_res)
+        return data
     except:
-        return "CHAT"
+        return {"intent": "INFO", "keywords": [query]}
 
 def get_internal_context(query: str):
-    """DB 지식 검색 및 동적 URL 생성 (NFC 및 URL 인코딩 적용)"""
-    query_vec = embed_model.encode(query)
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cursor = conn.cursor(dictionary=True)
+    """DB 지식 검색 로직 (Thread-Safe + Lock 적용)"""
+    
+    # 🚨 [핵심 수정] 임베딩 생성 시점에만 Lock을 걸어 세그먼테이션 폴트 방지
+    with embedding_lock:
+        query_vec = embed_model.encode(query)
+    
+    conn = None
+    cursor = None
     try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        
         sql = f"SELECT original_content, title, source_url, VECTOR_TO_STRING(embedding) as vector_str FROM {TABLE_NAME}"
         cursor.execute(sql)
         rows = cursor.fetchall()
@@ -82,15 +103,43 @@ def get_internal_context(query: str):
                 full_url = f"{BASE_DOCS_URL}{encoded_file_name}" if file_name else ""
                 
                 results.append({
-                    "distance": distance,
-                    "content": row['original_content'],
-                    "title": row['title'],
-                    "url": full_url
+                    "distance": distance, "content": row['original_content'], "title": row['title'], "url": full_url
                 })
         results.sort(key=lambda x: x['distance'])
-        return results[:5] 
+        return results[:3] 
+    except Exception as e:
+        print(f"⚠️ DB 검색 에러: {e}")
+        return []
     finally:
-        cursor.close(); conn.close()
+        if cursor: cursor.close()
+        if conn and conn.is_connected(): conn.close()
+
+def parallel_search_and_merge(keywords):
+    """안정성이 강화된 병렬 검색"""
+    if not keywords: return []
+
+    search_tasks = {
+        f"task_{i}": RunnableLambda(lambda x, k=kw: get_internal_context(k))
+        for i, kw in enumerate(keywords)
+    }
+
+    parallel_chain = RunnableParallel(**search_tasks)
+    
+    try:
+        # Lock이 보호해주므로 max_concurrency는 유지해도 안전합니다.
+        raw_results = parallel_chain.invoke({}, config={"max_concurrency": 3})
+    except Exception as e:
+        print(f"⚠️ 병렬 실행 충돌 발생, 순차 처리 전환")
+        raw_results = {f"task_{i}": get_internal_context(k) for i, k in enumerate(keywords)}
+
+    all_res = []
+    seen_content = set()
+    for task_id in raw_results:
+        for item in raw_results[task_id]:
+            if item['content'] not in seen_content:
+                all_res.append(item)
+                seen_content.add(item['content'])
+    return all_res
 
 # --- HTTP 핸들러 ---
 
@@ -103,7 +152,6 @@ class RAGHandler(BaseHTTPRequestHandler):
         
         params = parse_qs(parsed_path.query)
         query = params.get('query', [''])[0]
-        # 💡 프론트엔드에서 보낸 sessionId 수신 (없으면 기본값)
         session_id = params.get('sessionId', ['default_session'])[0]
         
         if not query: return
@@ -115,38 +163,29 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
 
-        print(f"\n📡 [요청 수신 | Session: {session_id}]: {query}")
-        
         try:
-            # 1. 💡 해당 세션의 이전 대화 기록 불러오기
-            if session_id not in chat_histories:
-                chat_histories[session_id] = []
-            
-            history = chat_histories[session_id]
-            # 최근 4개의 메시지만 맥락으로 사용 (토큰 절약 및 성능 최적화)
-            history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history[-4:]])
+            if session_id not in chat_histories: chat_histories[session_id] = []
+            history_text = "\n".join([f"{h['role']}: {h['content']}" for h in chat_histories[session_id][-4:]])
 
-            self._send_sse({"status": "🧠 생각 중..."})
-            intent = classify_intent(query, history_text)
+            self._send_sse({"status": "🧠 분석 중..."})
+            analysis = analyze_request(query, history_text)
+            intent = analysis.get("intent", "INFO").upper()
+            keywords = analysis.get("keywords", [query])
             
-            full_assistant_reply = "" # 대화 기록 저장을 위해 답변을 모아둠
+            full_assistant_reply = ""
 
             if intent == "CHAT":
-                self._send_sse({"status": "💬 지원 도우미 연결"})
-                prompt = f"당신은 기술 엔지니어입니다. 이전 대화를 참고하여 답변하세요.\n\n[이전 대화]\n{history_text}\n\n사용자: {query}"
-                for chunk in llm.stream(prompt):
+                self._send_sse({"status": "💬 답변 생성 중..."})
+                for chunk in llm.stream(f"기술 지원 엔지니어로서 답변하세요: {query}"):
                     if chunk: 
-                        self._send_sse({"chunk": chunk})
-                        full_assistant_reply += chunk
-                
+                        self._send_sse({"chunk": chunk}); full_assistant_reply += chunk
             else:
-                self._send_sse({"status": "🔍 지식 데이터 분석 중..."})
-                search_results = get_internal_context(query)
+                self._send_sse({"status": f"🔍 지식 검색 중 ({len(keywords)}개)..."})
+                search_results = parallel_search_and_merge(keywords)
                 
                 if search_results:
-                    self._send_sse({"status": "📋 가이드 생성 및 출처 확인 중..."})
+                    self._send_sse({"status": "📋 가이드 작성 중..."})
                     context_text = "\n".join([f"- {r['content']}" for r in search_results])
-                    
                     source_links = []
                     seen_urls = set()
                     for r in search_results:
@@ -154,45 +193,24 @@ class RAGHandler(BaseHTTPRequestHandler):
                             source_links.append(f"- [{r['title']}]({r['url']})")
                             seen_urls.add(r['url'])
                     
-                    source_section = "\n\n---\n### 🔗 참고 문서\n" + "\n".join(source_links) if source_links else ""
-                    
-                    prompt = (
-                        f"당신은 숙련된 시니어 기술 지원 엔지니어입니다. 아래 맥락과 지식 데이터를 바탕으로 답변하세요.\n\n"
-                        f"### [이전 대화 맥락]\n{history_text}\n\n"
-                        f"### [지식 데이터]\n{context_text}\n\n"
-                        f"### [응답 규칙]\n"
-                        f"1. **구조**: [## 📢 조치 안내] -> [### 🛠️ 해결 절차] -> [### 💡 추가 제언] 순서로 작성하세요.\n"
-                        f"2. **줄바꿈 최소화**: 문단 사이에는 빈 줄을 '단 하나'만 사용하세요.\n"
-                        f"3. **완결성**: 정중하고 간결하게 마무리하세요.\n\n"
-                        f"### [사용자 질문]\n{query}"
-                    )
-                    
+                    prompt = f"### [지식 데이터]\n{context_text}\n\n### [질문]\n{query}"
                     for chunk in llm.stream(prompt):
                         if chunk: 
-                            self._send_sse({"chunk": chunk})
-                            full_assistant_reply += chunk
+                            self._send_sse({"chunk": chunk}); full_assistant_reply += chunk
                     
-                    if source_section:
-                        self._send_sse({"chunk": source_section})
-                        full_assistant_reply += source_section
-                        
+                    if source_links:
+                        source_section = "\n\n---\n### 🔗 참고 문서\n" + "\n".join(source_links)
+                        self._send_sse({"chunk": source_section}); full_assistant_reply += source_section
                 else:
-                    self._send_sse({"status": "🌐 일반 지식 가이드 생성 중..."})
-                    prompt = f"맥락: {history_text}\n질문: {query}\n기술 엔지니어로서 핵심 위주로 답변하세요."
-                    for chunk in llm.stream(prompt):
+                    for chunk in llm.stream(query):
                         if chunk: 
-                            self._send_sse({"chunk": chunk})
-                            full_assistant_reply += chunk
+                            self._send_sse({"chunk": chunk}); full_assistant_reply += chunk
 
-            # 2. 💡 이번 대화 내용을 메모리에 저장
             chat_histories[session_id].append({"role": "user", "content": query})
             chat_histories[session_id].append({"role": "assistant", "content": full_assistant_reply})
-
             self._send_done()
-            print(f"✅ 처리 완료 (Intent: {intent})")
 
         except Exception as e:
-            print(f"❌ 에러: {e}")
             self._send_sse({"error": str(e)})
             try: self._send_done()
             except: pass
@@ -208,9 +226,5 @@ class RAGHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer(('localhost', 8000), RAGHandler)
-    print(f"📡 Intelligent Agent Core 가동 (Memory Session 기반): http://localhost:8000")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n🛑 서버를 종료합니다.")
-        server.server_close()
+    print(f"📡 Mac Optimized Agent 가동: http://localhost:8000")
+    server.serve_forever()
