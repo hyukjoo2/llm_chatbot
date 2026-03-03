@@ -150,7 +150,7 @@ class RAGHandler(BaseHTTPRequestHandler):
         try:
             if session_id not in chat_histories: chat_histories[session_id] = []
             
-            self._send_sse({"status": "🔍 지식 데이터 분석 중..."})
+            self._send_sse({"status": "🧠 지식 데이터 분석 중..."})
             search_results = get_internal_context(query)
             
             full_reply = ""
@@ -160,14 +160,15 @@ class RAGHandler(BaseHTTPRequestHandler):
                     for i, r in enumerate(search_results)
                 ])
                 
+                # 수정된 프롬프트 예시
                 prompt = (
-                    f"당신은 기술 지원 센터의 시니어 엔지니어입니다. 제공된 [지식 데이터]를 분석하여 답변하세요.\n\n"
+                    f"당신은 기술 지원 시니어 엔지니어입니다. 제공된 [지식 데이터]를 분석하여 답변하세요.\n\n"
                     f"### [지식 데이터]\n{context_combined}\n\n"
                     f"### [사용자 질문]\n{query}\n\n"
                     f"### [응답 규칙]\n"
-                    f"1. **직접 서술**: 문서 참조 번호는 생략하고 내용을 상세히 풀어서 설명하세요.\n"
-                    f"2. **우선순위**: '검증된 답변' 데이터가 있다면 이를 최우선으로 반영하세요.\n"
-                    f"3. **구조**: [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서로 작성하세요."
+                    f"1. **중요**: 질문이 [지식 데이터]의 내용과 관련이 없다면, 절대 지식 데이터를 언급하지 말고 일반적인 답변만 하세요.\n"  # 🚨 이 줄을 추가하세요!
+                    f"2. 직접 서술: 문서 참조 번호는 생략하고 내용을 상세히 풀어서 설명하세요.\n"
+                    f"3. 구조: [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서로 작성하세요."
                 )
                 
                 for chunk in llm.stream(prompt):
