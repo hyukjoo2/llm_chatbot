@@ -11,11 +11,10 @@ import ssl
 import urllib.parse
 import unicodedata
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
-
-from langchain_core.runnables import RunnableParallel, RunnableLambda
 
 # 1. 환경 변수 로드
 load_dotenv()
@@ -45,14 +44,14 @@ BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:3000/sources/")
 
 chat_histories = {}
 
-# 3. 모델 로드 (추론을 위해 Timeout을 넉넉히 설정)
+# 3. 모델 로드
 print(f"⏳ [System] 모델 로드 중... ({MODEL_NAME})")
 embed_model = SentenceTransformer('BAAI/bge-m3')
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
 print(f"✅ [System] 로드 완료.")
 
 def get_internal_context(query: str):
-    """DB 지식 검색 (추론을 위해 재료를 충분히 확보)"""
+    """DB 지식 검색 (피드백 데이터 우선순위 적용)"""
     with embedding_lock:
         query_vec = embed_model.encode(query)
     
@@ -60,7 +59,12 @@ def get_internal_context(query: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
-        sql = f"SELECT original_content, title, source_url, VECTOR_TO_STRING(embedding) as vector_str FROM {TABLE_NAME}"
+        # MySQL 9 VECTOR_TO_STRING 활용
+        sql = f"""
+            SELECT original_content, title, source_url, data_source, VECTOR_TO_STRING(embedding) as vector_str 
+            FROM {TABLE_NAME}
+            ORDER BY data_source DESC
+        """
         cursor.execute(sql)
         rows = cursor.fetchall()
         
@@ -70,17 +74,26 @@ def get_internal_context(query: str):
             db_vec = np.array(json.loads(row['vector_str']))
             distance = np.linalg.norm(query_vec - db_vec)
             
-            # 지식 단서를 충분히 가져오기 위해 2.6까지 허용
+            # 유사도 임계치 2.6
             if distance < 2.6:
-                file_name = row['source_url']
-                normalized = unicodedata.normalize('NFC', file_name)
+                source_url = row['source_url'] if row['source_url'] else ""
+                normalized = unicodedata.normalize('NFC', source_url)
                 encoded = urllib.parse.quote(normalized)
+                
                 results.append({
-                    "distance": distance, "content": row['original_content'], "title": row['title'], "url": f"{BASE_DOCS_URL}{encoded}"
+                    "distance": distance, 
+                    "content": row['original_content'], 
+                    "title": row['title'], 
+                    "data_source": row['data_source'],
+                    "url": f"{BASE_DOCS_URL}{encoded}" if source_url else "#"
                 })
-        results.sort(key=lambda x: x['distance'])
+        
+        # 피드백 데이터를 최우선(0), 매뉴얼을 다음(1)으로 정렬 후 거리순 정렬
+        results.sort(key=lambda x: (0 if x['data_source'] == 'feedback' else 1, x['distance']))
         return results[:3] 
-    except: return []
+    except Exception as e:
+        print(f"❌ DB 검색 오류: {e}")
+        return []
     finally:
         if conn and conn.is_connected(): conn.close()
 
@@ -89,7 +102,37 @@ def get_internal_context(query: str):
 class RAGHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
+    def do_OPTIONS(self):
+        """브라우저 CORS 대응 (Preflight)"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        """피드백 저장 엔드포인트"""
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/feedback":
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data)
+                
+                query = data.get("query")
+                answer = data.get("answer")
+                
+                if query and answer:
+                    self._save_feedback_to_db(query, answer)
+                    self._send_json_response({"status": "success", "message": "학습이 완료되었습니다."})
+                else:
+                    self._send_json_response({"status": "error", "message": "데이터가 부족합니다."}, status=400)
+            except Exception as e:
+                print(f"🚨 [POST Error] {e}")
+                self._send_json_response({"status": "error", "message": str(e)}, status=500)
+
     def do_GET(self):
+        """질문 답변 생성 (SSE 스트리밍)"""
         parsed_path = urlparse(self.path)
         if parsed_path.path != "/search": return
         params = parse_qs(parsed_path.query)
@@ -100,50 +143,44 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'close')
+        self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
 
         try:
             if session_id not in chat_histories: chat_histories[session_id] = []
-            history_text = "\n".join([f"{h['role']}: {h['content'][:100]}..." for h in chat_histories[session_id][-2:]])
-
-            self._send_sse({"status": "🔍 매뉴얼 상세 분석 중..."})
+            
+            self._send_sse({"status": "🔍 지식 데이터 분석 중..."})
             search_results = get_internal_context(query)
             
             full_reply = ""
-            
             if search_results:
-                # 데이터를 명확히 구분하여 전달
-                context_combined = "\n".join([f"[매뉴얼 데이터 {i+1}]:\n{r['content']}\n" for i, r in enumerate(search_results)])
+                context_combined = "\n".join([
+                    f"[{'기존 매뉴얼' if r['data_source']=='manual' else '검증된 답변'} {i+1}]:\n{r['content']}\n" 
+                    for i, r in enumerate(search_results)
+                ])
                 
-                # 🚨 [강력한 지시] 불성실한 답변 방지 및 직접 서술 강제
                 prompt = (
-                    f"당신은 기술 지원 센터의 시니어 엔지니어입니다. 제공된 [지식 데이터]를 분석하여 사용자의 질문에 성실히 답변하세요.\n\n"
+                    f"당신은 기술 지원 센터의 시니어 엔지니어입니다. 제공된 [지식 데이터]를 분석하여 답변하세요.\n\n"
                     f"### [지식 데이터]\n{context_combined}\n\n"
                     f"### [사용자 질문]\n{query}\n\n"
-                    f"### [응답 규칙 - 필독]\n"
-                    f"1. **직접 서술**: '참조 문서를 보세요' 혹은 '데이터에 정보가 있습니다' 같은 말은 절대 하지 마세요. 데이터에 있는 구체적인 설치 방법, 설정값, 단계를 직접 본문에 풀어서 쓰세요.\n"
-                    f"2. **친절한 가이드**: 사용자가 문서를 직접 찾아볼 필요가 없도록, 당신이 읽어주는 것처럼 상세하게 단계별(1., 2., 3.)로 설명하세요.\n"
-                    f"3. **추론 및 응용**: 질문에 대한 완벽한 문장이 없더라도, 데이터의 기술적 단서를 조합하여 '게이트웨이 설치를 위해서는 ~한 절차가 필요할 것으로 판단됩니다'와 같이 능동적으로 추론하세요.\n"
-                    f"4. **무관한 질문 차단**: 질문이 데이터와 0% 확률로 무관하면(예: 날씨) 데이터를 무시하고 일반 답변만 하세요.\n"
-                    f"5. **구조**: 반드시 [## 📢 조치 안내] -> [### 🛠️ 상세 설치 절차] -> [### 💡 핵심 주의사항] 순서로 작성하세요."
+                    f"### [응답 규칙]\n"
+                    f"1. **직접 서술**: 문서 참조 번호는 생략하고 내용을 상세히 풀어서 설명하세요.\n"
+                    f"2. **우선순위**: '검증된 답변' 데이터가 있다면 이를 최우선으로 반영하세요.\n"
+                    f"3. **구조**: [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서로 작성하세요."
                 )
                 
                 for chunk in llm.stream(prompt):
                     if chunk: 
                         self._send_sse({"chunk": chunk}); full_reply += chunk
                 
-                # 답변에 실질적인 정보(설치, 방법, 연결 등)가 포함된 경우에만 링크 노출
-                is_related = any(kw in full_reply for kw in ["설치", "방법", "절차", "연결", "설정"])
-                if is_related:
-                    source_links = list(set([f"- [{r['title']}]({r['url']})" for r in search_results]))
-                    source_section = "\n\n---\n### 🔗 참고 문서\n" + "\n".join(source_links)
+                valid_links = [f"- [{r['title']}]({r['url']})" for r in search_results if r['data_source'] == 'manual' and r['url'] != "#"]
+                if valid_links:
+                    source_section = "\n\n---\n### 🔗 참고 문서\n" + "\n".join(list(set(valid_links)))
                     self._send_sse({"chunk": source_section}); full_reply += source_section
             else:
                 for chunk in llm.stream(f"친절한 기술 상담원으로서 답변하세요: {query}"):
-                    if chunk: 
-                        self._send_sse({"chunk": chunk}); full_reply += chunk
+                    if chunk: self._send_sse({"chunk": chunk}); full_reply += chunk
 
             chat_histories[session_id].append({"role": "user", "content": query})
             chat_histories[session_id].append({"role": "assistant", "content": full_reply})
@@ -152,13 +189,67 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._send_done()
 
         except Exception as e:
+            print(f"🚨 [GET Error] {e}")
             self._send_sse({"error": str(e)}); self._send_done()
+
+    def _save_feedback_to_db(self, query, answer):
+        """MySQL 9 전용 피드백 저장 로직 (STRING_TO_VECTOR 및 직접 캐스팅 대응)"""
+        combined_text = f"질문: {query}\n전문가 답변: {answer}"
+        
+        with embedding_lock:
+            vector_np = embed_model.encode(combined_text)
+            vector_list = vector_np.tolist()
+        
+        # MySQL 9 벡터 규격 문자열 포맷팅
+        vector_str = "[" + ",".join(map(str, vector_list)) + "]"
+        
+        conn = None
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            
+            # 1. STRING_TO_VECTOR 함수 사용 시도 (MySQL 9 정석)
+            try:
+                sql = f"""
+                    INSERT INTO {TABLE_NAME} 
+                    (content_type, data_source, original_content, embedding, title, feedback_score)
+                    VALUES (%s, %s, %s, STRING_TO_VECTOR(%s), %s, %s)
+                """
+                params = ('text', 'feedback', combined_text, vector_str, '현장 검증 답변', 1)
+                cursor.execute(sql, params)
+            except mysql.connector.Error as err:
+                if err.errno == 1305: # 함수가 없는 경우 직접 캐스팅 시도
+                    sql = f"""
+                        INSERT INTO {TABLE_NAME} 
+                        (content_type, data_source, original_content, embedding, title, feedback_score)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(sql, params)
+                else: raise err
+
+            conn.commit()
+            print(f"✅ [Learning] 현장 지식 저장 성공: {query[:15]}...")
+            
+        except mysql.connector.Error as err:
+            print(f"❌ MySQL 저장 실패: {err}")
+            raise err
+        finally:
+            if conn and conn.is_connected():
+                cursor.close()
+                conn.close()
 
     def _send_sse(self, data):
         try:
             self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
             self.wfile.flush()
         except: pass
+
+    def _send_json_response(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
     def _send_done(self):
         try:
@@ -168,5 +259,5 @@ class RAGHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(('localhost', 8000), RAGHandler)
-    print(f"📡 High-Fidelity Reasoning Agent 가동: http://localhost:8000")
+    print(f"📡 Intelligent Learning Agent 가동: http://localhost:8000")
     server.serve_forever()

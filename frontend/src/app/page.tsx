@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 
 export default function ChatPage() {
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<{ role: string; content: string; status?: string }[]>([]);
+  const [messages, setMessages] = useState<{ role: string; content: string; status?: string; isFeedbackSent?: boolean }[]>([]);
   const [currentStatus, setCurrentStatus] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -14,12 +14,36 @@ export default function ChatPage() {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, currentStatus, isLoading]);
 
+  // 🚨 피드백 전송 함수
+  const handleFeedback = async (index: number, query: string, answer: string) => {
+    try {
+      const response = await fetch("http://localhost:8000/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, answer }),
+      });
+
+      if (response.ok) {
+        // 성공 시 해당 메시지의 버튼 상태 업데이트
+        setMessages((prev) =>
+          prev.map((msg, i) => (i === index ? { ...msg, isFeedbackSent: true } : msg))
+        );
+        
+      }
+    } catch (error) {
+      console.error("피드백 전송 실패:", error);
+      alert("피드백 전송 중 오류가 발생했습니다.");
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
 
     const userQuery = input;
     setInput("");
+    
+    // 메시지 추가 (이전 답변들까지 포함)
     setMessages((prev) => [...prev, { role: "user", content: userQuery }]);
     setIsLoading(true);
     setCurrentStatus("서버 연결 중...");
@@ -75,25 +99,22 @@ export default function ChatPage() {
     }
   };
 
-  /**
-   * 💡 줄바꿈 과잉 현상 해결 및 자소 분리(NFC) 대응
-   */
   const formatContent = (content: string) => {
     if (!content) return "";
     return content
-      .replace(/\\n/g, "\n")         // JSON 인코딩된 줄바꿈 복구
-      .replace(/\n{3,}/g, "\n\n")    // 과도한 개행 축소
-      .normalize("NFC")              // 💡 한글 자소 분리 현상(Mac NFD)을 표준(NFC)으로 결합
+      .replace(/\\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .normalize("NFC")
       .trim();
   };
 
   return (
     <div className="flex flex-col h-screen max-w-2xl mx-auto p-4 bg-gray-50 text-black font-sans">
-      <header className="py-4 border-b">
+      <header className="py-4 border-b flex justify-between items-center">
         <h1 className="text-xl font-bold text-blue-600">올댓애스크</h1>
+        <span className="text-[10px] bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full font-semibold">AI Assistant</span>
       </header>
 
-      {/* 메시지 리스트 */}
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
         {messages.map((msg, i) => (
           <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
@@ -114,7 +135,6 @@ export default function ChatPage() {
                       ul: ({node, ...props}) => <ul className="list-disc pl-4 mb-2" {...props} />,
                       li: ({node, ...props}) => <li className="mb-0.5" {...props} />,
                       hr: () => <hr className="my-4 border-gray-100" />,
-                      // 🔗 링크 스타일 및 속성 유지
                       a: ({node, ...props}) => (
                         <a 
                           className="text-blue-500 hover:text-blue-700 underline underline-offset-4 font-bold transition-colors break-all" 
@@ -128,12 +148,26 @@ export default function ChatPage() {
                     {formatContent(msg.content)}
                   </ReactMarkdown>
                   
+                  {/* 🚨 피드백 UI 추가 영역 */}
                   {!isLoading && i === messages.length - 1 && (
                     <div className="mt-4 pt-3 border-t border-dashed border-gray-200">
-                      <p className="text-xs text-blue-500 font-semibold mb-1">💡 추가 도움이 필요하신가요?</p>
-                      <p className="text-[11px] text-gray-400">
-                        위 조치로 해결되지 않으면 언제든 물어봐 주세요.
-                      </p>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <p className="text-xs text-blue-500 font-semibold mb-1">💡 해결에 도움이 되었나요?</p>
+                          <p className="text-[11px] text-gray-400">도움이 되었다면 버튼을 눌러 AI를 학습시켜주세요.</p>
+                        </div>
+                        <button
+                          onClick={() => handleFeedback(i, messages[i-1]?.content || "", msg.content)}
+                          disabled={msg.isFeedbackSent}
+                          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition-all shadow-sm ${
+                            msg.isFeedbackSent 
+                              ? "bg-green-100 text-green-600 cursor-default" 
+                              : "bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white active:scale-95"
+                          }`}
+                        >
+                          {msg.isFeedbackSent ? "학습완료 ✅" : "도움됨 👍"}
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -142,7 +176,6 @@ export default function ChatPage() {
           </div>
         ))}
 
-        {/* 인디케이터 위치 유지 */}
         {isLoading && (
           <div className="flex justify-start">
             <div className="bg-blue-50 text-blue-600 text-sm px-4 py-2 rounded-full border border-blue-100 animate-pulse flex items-center gap-2">
@@ -155,7 +188,6 @@ export default function ChatPage() {
         <div ref={scrollRef} />
       </div>
 
-      {/* 입력창 */}
       <form onSubmit={handleSubmit} className="p-4 border-t bg-white flex gap-2">
         <input
           className="flex-1 border border-gray-300 rounded-full px-5 py-3 focus:outline-none focus:ring-2 focus:ring-blue-400 text-black placeholder-gray-400"
