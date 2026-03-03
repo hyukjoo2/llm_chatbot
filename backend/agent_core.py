@@ -126,7 +126,7 @@ class RAGHandler(BaseHTTPRequestHandler):
             # 최근 4개의 메시지만 맥락으로 사용 (토큰 절약 및 성능 최적화)
             history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history[-4:]])
 
-            self._send_sse({"status": "🧠 맥락 분석 및 의도 파악 중..."})
+            self._send_sse({"status": "🧠 Thinking..."})
             intent = classify_intent(query, history_text)
             
             full_assistant_reply = "" # 대화 기록 저장을 위해 답변을 모아둠
