@@ -13,7 +13,7 @@ pip install -r requirements.txt
 
 # 서버 실행
 python agent_core.py
-```
+```ㅁ
 
 ### 2. 프론트엔드 설정 (Next.js)
 
@@ -23,4 +23,9 @@ npm install
 
 # 개발 서버 실행
 npm run dev
+```
+
+### 3. DB 접속
+```
+docker exec -it pg-vector psql -U myuser -d llm_chatbot
 ```

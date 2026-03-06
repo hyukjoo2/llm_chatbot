@@ -1,11 +1,12 @@
 import os
-
 # 🚨 Mac 환경에서 Segmentation Fault 방지
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
 import numpy as np
-import mysql.connector
+import psycopg2  # PostgreSQL 전용
+import psycopg2.extras # DictCursor 사용을 위해 추가
+from pgvector.psycopg2 import register_vector # pgvector 등록용
 import warnings
 import ssl
 import urllib.parse
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 
 # 1. 환경 변수 로드
 load_dotenv()
+warnings.filterwarnings("ignore")
 
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -27,83 +29,98 @@ else: ssl._create_default_https_context = _create_unverified_https_context
 from langchain_community.llms import Ollama
 from sentence_transformers import SentenceTransformer
 
-warnings.filterwarnings("ignore")
-embedding_lock = threading.Lock()
-
-# 2. 설정값
+# 2. .env 설정값 로드
 MODEL_NAME = os.getenv("LLM_MODEL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD", ""), 
-    "database": os.getenv("DB_NAME")
-}
+EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
-BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:3000/sources/")
+BASE_DOCS_URL = os.getenv("BASE_DOCS_URL")
+DB_NAME = os.getenv("DB_NAME")
 
-chat_histories = {}
+# PostgreSQL 연결 정보
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "user": os.getenv("DB_USER", "myuser"),
+    "password": os.getenv("DB_PASSWORD", "1234"),
+    "dbname": DB_NAME
+}
+
+# 설정값 검증
+if not all([MODEL_NAME, EMBED_MODEL_NAME, TABLE_NAME, DB_NAME]):
+    print("❌ [Error] .env 설정이 누락되었습니다.")
+    exit(1)
+
+embedding_lock = threading.Lock()
 
 # 3. 모델 로드
-print(f"⏳ [System] 모델 로드 중... ({MODEL_NAME})")
-embed_model = SentenceTransformer('BAAI/bge-m3')
+print(f"⏳ [System] 모델 로드 중... ({EMBED_MODEL_NAME})")
+embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
-print(f"✅ [System] 로드 완료.")
+print(f"✅ [System] PostgreSQL pgvector RAG 엔진 가동 준비 완료.")
+
+# --- 유틸리티 함수 ---
 
 def get_internal_context(query: str):
-    """DB 지식 검색 (피드백 데이터 우선순위 적용)"""
+    """PostgreSQL pgvector 전용 <=> 연산자 활용 검색 (형변환 에러 수정)"""
     with embedding_lock:
-        query_vec = embed_model.encode(query)
+        instruction = "Represent this sentence for searching relevant passages: "
+        query_vec = embed_model.encode(instruction + query).tolist()
     
     conn = None
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
-        # MySQL 9 VECTOR_TO_STRING 활용
+        conn = psycopg2.connect(**DB_CONFIG)
+        register_vector(conn) # 💡 pgvector 타입 등록
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # 💡 [핵심 수정] %s 뒤에 ::vector를 붙여서 명시적으로 형변환을 해줍니다.
+        # 이 처리가 없으면 'operator does not exist: vector <=> numeric[]' 에러가 발생합니다.
         sql = f"""
-            SELECT original_content, title, source_url, data_source, VECTOR_TO_STRING(embedding) as vector_str 
+            SELECT original_content, title, source_url, data_source, 
+                   (embedding <=> %s::vector) AS dist
             FROM {TABLE_NAME}
-            ORDER BY data_source DESC
+            ORDER BY (CASE WHEN data_source = 'feedback' THEN 0 ELSE 1 END) ASC, dist ASC
+            LIMIT 5
         """
-        cursor.execute(sql)
+        cursor.execute(sql, (query_vec,))
         rows = cursor.fetchall()
         
         results = []
+        print(f"\n🔍 [Search Debug] 질문: '{query}'")
         for row in rows:
-            if not row['vector_str']: continue
-            db_vec = np.array(json.loads(row['vector_str']))
-            distance = np.linalg.norm(query_vec - db_vec)
+            dist = float(row['dist'])
+            print(f"   - [{row['data_source']}] {row['title']} | 거리: {dist:.4f}")
             
-            # 유사도 임계치 2.6
-            if distance < 2.6:
+            # 임계치 설정 (BGE-Small 기준 0.6 내외 권장)
+            if dist < 0.6: 
                 source_url = row['source_url'] if row['source_url'] else ""
                 normalized = unicodedata.normalize('NFC', source_url)
                 encoded = urllib.parse.quote(normalized)
                 
                 results.append({
-                    "distance": distance, 
                     "content": row['original_content'], 
                     "title": row['title'], 
-                    "data_source": row['data_source'],
                     "url": f"{BASE_DOCS_URL}{encoded}" if source_url else "#"
                 })
-        
-        # 피드백 데이터를 최우선(0), 매뉴얼을 다음(1)으로 정렬 후 거리순 정렬
-        results.sort(key=lambda x: (0 if x['data_source'] == 'feedback' else 1, x['distance']))
-        return results[:3] 
-    except Exception as e:
-        print(f"❌ DB 검색 오류: {e}")
+        return results
+    except Exception as err:
+        print(f"❌ [DB Error] {err}")
         return []
     finally:
-        if conn and conn.is_connected(): conn.close()
+        if conn: conn.close()
 
 # --- HTTP 핸들러 ---
 
 class RAGHandler(BaseHTTPRequestHandler):
-    protocol_version = 'HTTP/1.1'
+    def _send_sse(self, data):
+        self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
+        self.wfile.flush()
+
+    def _send_done(self):
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def do_OPTIONS(self):
-        """브라우저 CORS 대응 (Preflight)"""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -111,33 +128,27 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        """피드백 저장 엔드포인트"""
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == "/feedback":
+        if self.path == "/feedback":
             try:
                 content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                data = json.loads(post_data)
-                
-                query = data.get("query")
-                answer = data.get("answer")
-                
+                data = json.loads(self.rfile.read(content_length))
+                query, answer = data.get("query"), data.get("answer")
                 if query and answer:
                     self._save_feedback_to_db(query, answer)
-                    self._send_json_response({"status": "success", "message": "학습이 완료되었습니다."})
-                else:
-                    self._send_json_response({"status": "error", "message": "데이터가 부족합니다."}, status=400)
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "success", "message": "성공적으로 학습되었습니다."}).encode())
             except Exception as e:
-                print(f"🚨 [POST Error] {e}")
-                self._send_json_response({"status": "error", "message": str(e)}, status=500)
+                print(f"🚨 피드백 저장 오류: {e}")
 
     def do_GET(self):
-        """질문 답변 생성 (SSE 스트리밍)"""
         parsed_path = urlparse(self.path)
         if parsed_path.path != "/search": return
+        
         params = parse_qs(parsed_path.query)
         query = params.get('query', [''])[0]
-        session_id = params.get('sessionId', ['default_session'])[0]
         if not query: return
 
         self.send_response(200)
@@ -148,117 +159,60 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            if session_id not in chat_histories: chat_histories[session_id] = []
-            
-            self._send_sse({"status": "🧠 지식 데이터 분석 중..."})
+            self._send_sse({"status": "🔍 지식 데이터 검색 중..."})
             search_results = get_internal_context(query)
             
-            full_reply = ""
             if search_results:
-                context_combined = "\n".join([
-                    f"[{'기존 매뉴얼' if r['data_source']=='manual' else '검증된 답변'} {i+1}]:\n{r['content']}\n" 
-                    for i, r in enumerate(search_results)
-                ])
+                context_combined = "\n".join([f"### [데이터]: {r['content']}" for r in search_results])
                 
-                # 수정된 프롬프트 예시
                 prompt = (
-                    f"당신은 기술 지원 시니어 엔지니어입니다. 제공된 [지식 데이터]를 분석하여 답변하세요.\n\n"
+                    f"당신은 기술지원 전문가입니다. 반드시 아래 [지식 데이터]만을 근거로 한국어로 답변하세요.\n"
+                    f"데이터에 없는 내용은 아는 척하지 마세요.\n\n"
                     f"### [지식 데이터]\n{context_combined}\n\n"
                     f"### [사용자 질문]\n{query}\n\n"
                     f"### [응답 규칙]\n"
-                    f"1. **중요**: 질문이 [지식 데이터]의 내용과 관련이 없다면, 절대 지식 데이터를 언급하지 말고 일반적인 답변만 하세요.\n"  # 🚨 이 줄을 추가하세요!
-                    f"2. 직접 서술: 문서 참조 번호는 생략하고 내용을 상세히 풀어서 설명하세요.\n"
-                    f"3. 구조: [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서로 작성하세요."
+                    f"1. [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서 엄수.\n"
+                    f"2. 아주 상세하고 친절하게 답변할 것."
                 )
                 
                 for chunk in llm.stream(prompt):
-                    if chunk: 
-                        self._send_sse({"chunk": chunk}); full_reply += chunk
+                    if chunk: self._send_sse({"chunk": chunk})
                 
-                valid_links = [f"- [{r['title']}]({r['url']})" for r in search_results if r['data_source'] == 'manual' and r['url'] != "#"]
+                valid_links = list(set([f"- [{r['title']}]({r['url']})" for r in search_results if r['url'] != "#"]))
                 if valid_links:
-                    source_section = "\n\n---\n### 🔗 참고 문서\n" + "\n".join(list(set(valid_links)))
-                    self._send_sse({"chunk": source_section}); full_reply += source_section
+                    self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + "\n".join(valid_links)})
             else:
-                for chunk in llm.stream(f"친절한 기술 상담원으로서 답변하세요: {query}"):
-                    if chunk: self._send_sse({"chunk": chunk}); full_reply += chunk
-
-            chat_histories[session_id].append({"role": "user", "content": query})
-            chat_histories[session_id].append({"role": "assistant", "content": full_reply})
-            if len(chat_histories[session_id]) > 4: chat_histories[session_id].pop(0)
+                self._send_sse({"chunk": "관련 정보를 찾지 못했습니다. 일반 지식으로 답변해 드릴까요?"})
 
             self._send_done()
-
         except Exception as e:
-            print(f"🚨 [GET Error] {e}")
+            print(f"🚨 서버 오류: {e}")
             self._send_sse({"error": str(e)}); self._send_done()
 
     def _save_feedback_to_db(self, query, answer):
-        """MySQL 9 전용 피드백 저장 로직 (STRING_TO_VECTOR 및 직접 캐스팅 대응)"""
         combined_text = f"질문: {query}\n전문가 답변: {answer}"
-        
         with embedding_lock:
-            vector_np = embed_model.encode(combined_text)
-            vector_list = vector_np.tolist()
-        
-        # MySQL 9 벡터 규격 문자열 포맷팅
-        vector_str = "[" + ",".join(map(str, vector_list)) + "]"
+            # 💡 피드백 저장 시에도 리스트 형태로 전달
+            vector = embed_model.encode(combined_text).tolist()
         
         conn = None
         try:
-            conn = mysql.connector.connect(**DB_CONFIG)
+            conn = psycopg2.connect(**DB_CONFIG)
+            register_vector(conn)
             cursor = conn.cursor()
-            
-            # 1. STRING_TO_VECTOR 함수 사용 시도 (MySQL 9 정석)
-            try:
-                sql = f"""
-                    INSERT INTO {TABLE_NAME} 
-                    (content_type, data_source, original_content, embedding, title, feedback_score)
-                    VALUES (%s, %s, %s, STRING_TO_VECTOR(%s), %s, %s)
-                """
-                params = ('text', 'feedback', combined_text, vector_str, '현장 검증 답변', 1)
-                cursor.execute(sql, params)
-            except mysql.connector.Error as err:
-                if err.errno == 1305: # 함수가 없는 경우 직접 캐스팅 시도
-                    sql = f"""
-                        INSERT INTO {TABLE_NAME} 
-                        (content_type, data_source, original_content, embedding, title, feedback_score)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """
-                    cursor.execute(sql, params)
-                else: raise err
-
+            # 💡 여기도 필요시 %s::vector 로 캐스팅할 수 있으나 register_vector가 처리함
+            sql = f"""
+                INSERT INTO {TABLE_NAME} 
+                (content_type, data_source, original_content, embedding, title) 
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, ('text', 'feedback', combined_text, vector, '검증된 답변'))
             conn.commit()
-            print(f"✅ [Learning] 현장 지식 저장 성공: {query[:15]}...")
-            
-        except mysql.connector.Error as err:
-            print(f"❌ MySQL 저장 실패: {err}")
-            raise err
         finally:
-            if conn and conn.is_connected():
-                cursor.close()
-                conn.close()
-
-    def _send_sse(self, data):
-        try:
-            self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
-            self.wfile.flush()
-        except: pass
-
-    def _send_json_response(self, data, status=200):
-        self.send_response(status)
-        self.send_header('Content-type', 'application/json; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
-
-    def _send_done(self):
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except: pass
+            if conn: conn.close()
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(('localhost', 8000), RAGHandler)
-    print(f"📡 Intelligent Learning Agent 가동: http://localhost:8000")
+    # 서버 실행 (localhost:8000)
+    server = ThreadingHTTPServer(('0.0.0.0', 8000), RAGHandler)
+    print(f"📡 PostgreSQL pgvector RAG Service 가동: http://localhost:8000")
     server.serve_forever()
