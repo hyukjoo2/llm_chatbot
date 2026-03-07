@@ -59,4 +59,6 @@ Docker: Dockerfile을 만들어 컨테이너로 배포합니다.
 ### 3. DB 접속
 ```
 docker exec -it pg-vector psql -U myuser -d llm_chatbot
+
+TRUNCATE TABLE rag_vectors;
 ```

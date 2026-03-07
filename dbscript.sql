@@ -1,5 +1,5 @@
 CREATE DATABASE IF NOT EXISTS llm_chatbot;
-USE llm_chatbot;
+\c llm_chatbot
 
 -- 기존 테이블이 있다면 삭제 (데이터가 없다면 실행)
 DROP TABLE IF EXISTS rag_vectors;
