@@ -65,6 +65,8 @@ next-env.d.ts
 # PDF 원본 파일은 용량 및 보안상 제외하고, 폴더 구조만 유지합니다.
 frontend/public/sources/*
 rag/sources/*
+rag/converted_texts/*
+backend/storage/*
 
 # 추가: 100MB 넘는 바이너리 파일 확장자들 원천 차단
 *.node

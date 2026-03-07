@@ -13,8 +13,9 @@ import urllib.parse
 import unicodedata
 import threading
 import time
+import mimetypes # 💡 파일 타입 인식을 위해 추가
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote # 💡 unquote 추가
 from dotenv import load_dotenv
 
 # 1. 환경 변수 로드
@@ -34,7 +35,7 @@ MODEL_NAME = os.getenv("LLM_MODEL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
-BASE_DOCS_URL = os.getenv("BASE_DOCS_URL")
+BASE_DOCS_URL = os.getenv("BASE_DOCS_URL") # 💡 .env에서 http://localhost:8000/files/ 로 수정 필요
 DB_NAME = os.getenv("DB_NAME")
 
 # PostgreSQL 연결 정보
@@ -45,6 +46,11 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "1234"),
     "dbname": DB_NAME
 }
+
+# 💡 실시간 파일 저장용 폴더 생성
+STORAGE_DIR = os.path.join(os.getcwd(), "storage")
+if not os.path.exists(STORAGE_DIR):
+    os.makedirs(STORAGE_DIR)
 
 # 설정값 검증
 if not all([MODEL_NAME, EMBED_MODEL_NAME, TABLE_NAME, DB_NAME]):
@@ -62,7 +68,7 @@ print(f"✅ [System] PostgreSQL pgvector RAG 엔진 가동 준비 완료.")
 # --- 유틸리티 함수 ---
 
 def get_internal_context(query: str):
-    """PostgreSQL pgvector 전용 <=> 연산자 활용 검색 (형변환 에러 수정)"""
+    """PostgreSQL pgvector 전용 <=> 연산자 활용 검색"""
     with embedding_lock:
         instruction = "Represent this sentence for searching relevant passages: "
         query_vec = embed_model.encode(instruction + query).tolist()
@@ -70,17 +76,16 @@ def get_internal_context(query: str):
     conn = None
     try:
         conn = psycopg2.connect(**DB_CONFIG)
-        register_vector(conn) # 💡 pgvector 타입 등록
+        register_vector(conn)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # 💡 [핵심 수정] %s 뒤에 ::vector를 붙여서 명시적으로 형변환을 해줍니다.
-        # 이 처리가 없으면 'operator does not exist: vector <=> numeric[]' 에러가 발생합니다.
+        # 💡 LIMIT를 10으로 늘려 추론 재료를 더 많이 확보합니다.
         sql = f"""
             SELECT original_content, title, source_url, data_source, 
                    (embedding <=> %s::vector) AS dist
             FROM {TABLE_NAME}
             ORDER BY (CASE WHEN data_source = 'feedback' THEN 0 ELSE 1 END) ASC, dist ASC
-            LIMIT 5
+            LIMIT 10
         """
         cursor.execute(sql, (query_vec,))
         rows = cursor.fetchall()
@@ -91,9 +96,9 @@ def get_internal_context(query: str):
             dist = float(row['dist'])
             print(f"   - [{row['data_source']}] {row['title']} | 거리: {dist:.4f}")
             
-            # 임계치 설정 (BGE-Small 기준 0.6 내외 권장)
             if dist < 0.6: 
                 source_url = row['source_url'] if row['source_url'] else ""
+                # 💡 한글 자소 분리 방지 및 인코딩
                 normalized = unicodedata.normalize('NFC', source_url)
                 encoded = urllib.parse.quote(normalized)
                 
@@ -127,6 +132,26 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
+    # 💡 정적 파일 서빙 로직 (운영 중 실시간 파일 조회용)
+    def serve_static_file(self, file_path):
+        try:
+            # URL 인코딩된 경로 해제 (한글 포함)
+            decoded_filename = unquote(file_path)
+            full_path = os.path.join(STORAGE_DIR, decoded_filename)
+
+            if os.path.exists(full_path) and os.path.isfile(full_path):
+                self.send_response(200)
+                mime_type, _ = mimetypes.guess_type(full_path)
+                self.send_header('Content-type', mime_type or 'application/octet-stream')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with open(full_path, 'rb') as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_error(404, "File Not Found")
+        except Exception as e:
+            self.send_error(500, str(e))
+
     def do_POST(self):
         if self.path == "/feedback":
             try:
@@ -145,54 +170,63 @@ class RAGHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
-        if parsed_path.path != "/search": return
         
-        params = parse_qs(parsed_path.query)
-        query = params.get('query', [''])[0]
-        if not query: return
+        # 💡 1. 파일 요청 처리 (/files/...)
+        if parsed_path.path.startswith("/files/"):
+            file_path = parsed_path.path[7:] # '/files/' 이후 부분
+            self.serve_static_file(file_path)
+            return
 
-        self.send_response(200)
-        self.send_header('Content-type', 'text/event-stream; charset=utf-8')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'keep-alive')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
+        # 2. 검색 요청 처리 (/search)
+        if parsed_path.path == "/search":
+            params = parse_qs(parsed_path.query)
+            query = params.get('query', [''])[0]
+            if not query: return
 
-        try:
-            self._send_sse({"status": "🔍 지식 데이터 검색 중..."})
-            search_results = get_internal_context(query)
-            
-            if search_results:
-                context_combined = "\n".join([f"### [데이터]: {r['content']}" for r in search_results])
-                
-                prompt = (
-                    f"당신은 기술지원 전문가입니다. 반드시 아래 [지식 데이터]만을 근거로 한국어로 답변하세요.\n"
-                    f"데이터에 없는 내용은 아는 척하지 마세요.\n\n"
-                    f"### [지식 데이터]\n{context_combined}\n\n"
-                    f"### [사용자 질문]\n{query}\n\n"
-                    f"### [응답 규칙]\n"
-                    f"1. [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서 엄수.\n"
-                    f"2. 아주 상세하고 친절하게 답변할 것."
-                )
-                
-                for chunk in llm.stream(prompt):
-                    if chunk: self._send_sse({"chunk": chunk})
-                
-                valid_links = list(set([f"- [{r['title']}]({r['url']})" for r in search_results if r['url'] != "#"]))
-                if valid_links:
-                    self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + "\n".join(valid_links)})
-            else:
-                self._send_sse({"chunk": "관련 정보를 찾지 못했습니다. 일반 지식으로 답변해 드릴까요?"})
+            self.send_response(200)
+            self.send_header('Content-type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
 
-            self._send_done()
-        except Exception as e:
-            print(f"🚨 서버 오류: {e}")
-            self._send_sse({"error": str(e)}); self._send_done()
+            try:
+                self._send_sse({"status": "🔍 지식 데이터 검색 중..."})
+                search_results = get_internal_context(query)
+                
+                if search_results:
+                    context_combined = "\n".join([f"### [데이터]: {r['content']}" for r in search_results])
+                    
+                    # 💡 [논리적 추론 허용 프롬프트]로 수정
+                    prompt = (
+                        f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하되, "
+                        f"직접적인 절차가 없더라도 데이터 내의 메뉴명, 버튼 이름 등을 활용해 논리적으로 추론하여 안내하세요.\n"
+                        f"단, 데이터에 전혀 근거가 없는 내용은 지어내지 마세요.\n\n"
+                        f"### [지식 데이터]\n{context_combined}\n\n"
+                        f"### [사용자 질문]\n{query}\n\n"
+                        f"### [응답 규칙]\n"
+                        f"1. [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서 엄수.\n"
+                        f"2. 추론한 내용일 경우 '매뉴얼 기반 추론 절차입니다'라고 명시하세요.\n"
+                        f"3. 아주 상세하고 친절하게 답변할 것."
+                    )
+                    
+                    for chunk in llm.stream(prompt):
+                        if chunk: self._send_sse({"chunk": chunk})
+                    
+                    valid_links = list(set([f"- [{r['title']}]({r['url']})" for r in search_results if r['url'] != "#"]))
+                    if valid_links:
+                        self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + "\n".join(valid_links)})
+                else:
+                    self._send_sse({"chunk": "관련 정보를 찾지 못했습니다. 일반 지식으로 답변해 드릴까요?"})
+
+                self._send_done()
+            except Exception as e:
+                print(f"🚨 서버 오류: {e}")
+                self._send_sse({"error": str(e)}); self._send_done()
 
     def _save_feedback_to_db(self, query, answer):
         combined_text = f"질문: {query}\n전문가 답변: {answer}"
         with embedding_lock:
-            # 💡 피드백 저장 시에도 리스트 형태로 전달
             vector = embed_model.encode(combined_text).tolist()
         
         conn = None
@@ -200,7 +234,6 @@ class RAGHandler(BaseHTTPRequestHandler):
             conn = psycopg2.connect(**DB_CONFIG)
             register_vector(conn)
             cursor = conn.cursor()
-            # 💡 여기도 필요시 %s::vector 로 캐스팅할 수 있으나 register_vector가 처리함
             sql = f"""
                 INSERT INTO {TABLE_NAME} 
                 (content_type, data_source, original_content, embedding, title) 
@@ -215,4 +248,5 @@ if __name__ == "__main__":
     # 서버 실행 (localhost:8000)
     server = ThreadingHTTPServer(('0.0.0.0', 8000), RAGHandler)
     print(f"📡 PostgreSQL pgvector RAG Service 가동: http://localhost:8000")
+    print(f"📂 정적 파일 저장소: {STORAGE_DIR}")
     server.serve_forever()
