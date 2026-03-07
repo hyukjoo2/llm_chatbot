@@ -4,18 +4,18 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
 import numpy as np
-import psycopg2  # PostgreSQL 전용
-import psycopg2.extras # DictCursor 사용을 위해 추가
-from pgvector.psycopg2 import register_vector # pgvector 등록용
+import psycopg2 
+import psycopg2.extras 
+from pgvector.psycopg2 import register_vector 
 import warnings
 import ssl
 import urllib.parse
 import unicodedata
 import threading
 import time
-import mimetypes # 💡 파일 타입 인식을 위해 추가
+import mimetypes 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote # 💡 unquote 추가
+from urllib.parse import urlparse, parse_qs, unquote 
 from dotenv import load_dotenv
 
 # 1. 환경 변수 로드
@@ -35,7 +35,7 @@ MODEL_NAME = os.getenv("LLM_MODEL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
-BASE_DOCS_URL = os.getenv("BASE_DOCS_URL") # 💡 .env에서 http://localhost:8000/files/ 로 수정 필요
+BASE_DOCS_URL = os.getenv("BASE_DOCS_URL")
 DB_NAME = os.getenv("DB_NAME")
 
 # PostgreSQL 연결 정보
@@ -47,15 +47,9 @@ DB_CONFIG = {
     "dbname": DB_NAME
 }
 
-# 💡 실시간 파일 저장용 폴더 생성
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
 if not os.path.exists(STORAGE_DIR):
     os.makedirs(STORAGE_DIR)
-
-# 설정값 검증
-if not all([MODEL_NAME, EMBED_MODEL_NAME, TABLE_NAME, DB_NAME]):
-    print("❌ [Error] .env 설정이 누락되었습니다.")
-    exit(1)
 
 embedding_lock = threading.Lock()
 
@@ -63,13 +57,17 @@ embedding_lock = threading.Lock()
 print(f"⏳ [System] 모델 로드 중... ({EMBED_MODEL_NAME})")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
-print(f"✅ [System] PostgreSQL pgvector RAG 엔진 가동 준비 완료.")
+print(f"✅ [System] PostgreSQL 하이브리드 RAG 엔진 가동 준비 완료.")
 
 # --- 유틸리티 함수 ---
 
 def get_internal_context(query: str):
-    """PostgreSQL pgvector 전용 <=> 연산자 활용 검색"""
+    """
+    💡 [최적화] 하이브리드 검색 (벡터 유사도 + 키워드 일치)
+    RRF(Reciprocal Rank Fusion) 알고리즘을 사용하여 두 검색 결과의 순위를 통합합니다.
+    """
     with embedding_lock:
+        # BGE 모델 특성상 지시문 포함
         instruction = "Represent this sentence for searching relevant passages: "
         query_vec = embed_model.encode(instruction + query).tolist()
     
@@ -79,34 +77,52 @@ def get_internal_context(query: str):
         register_vector(conn)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # 💡 LIMIT를 10으로 늘려 추론 재료를 더 많이 확보합니다.
+        # 💡 하이브리드 검색 SQL: 벡터 검색과 키워드(to_tsquery) 검색을 결합
+        # - 벡터: <=> 연산자 (Cosine Distance)
+        # - 키워드: ts_rank (키워드 빈도 및 근접도 점수)
         sql = f"""
-            SELECT original_content, title, source_url, data_source, 
-                   (embedding <=> %s::vector) AS dist
-            FROM {TABLE_NAME}
-            ORDER BY (CASE WHEN data_source = 'feedback' THEN 0 ELSE 1 END) ASC, dist ASC
-            LIMIT 10
+            WITH vector_matches AS (
+                SELECT id, (embedding <=> %s::vector) AS dist
+                FROM {TABLE_NAME}
+                ORDER BY dist ASC
+                LIMIT 20
+            ),
+            keyword_matches AS (
+                SELECT id, ts_rank(content_search_vector, plainto_tsquery('simple', %s)) AS rank
+                FROM {TABLE_NAME}
+                WHERE content_search_vector @@ plainto_tsquery('simple', %s)
+                ORDER BY rank DESC
+                LIMIT 20
+            )
+            SELECT 
+                t.original_content, t.title, t.source_url, t.data_source,
+                COALESCE(1.0 / (60 + v.dist * 100), 0) + COALESCE(k.rank, 0) AS combined_score
+            FROM {TABLE_NAME} t
+            LEFT JOIN vector_matches v ON t.id = v.id
+            LEFT JOIN keyword_matches k ON t.id = k.id
+            WHERE v.id IS NOT NULL OR k.id IS NOT NULL
+            ORDER BY (CASE WHEN t.data_source = 'feedback' THEN 0 ELSE 1 END) ASC, combined_score DESC
+            LIMIT 7;
         """
-        cursor.execute(sql, (query_vec,))
+        
+        # plainto_tsquery를 사용해 일반 문장을 검색어 쿼리로 변환합니다.
+        cursor.execute(sql, (query_vec, query, query))
         rows = cursor.fetchall()
         
         results = []
-        print(f"\n🔍 [Search Debug] 질문: '{query}'")
+        print(f"\n🔍 [Hybrid Search Debug] 질문: '{query}'")
         for row in rows:
-            dist = float(row['dist'])
-            print(f"   - [{row['data_source']}] {row['title']} | 거리: {dist:.4f}")
+            print(f"   - [{row['data_source']}] {row['title']} | 점수: {row['combined_score']:.4f}")
             
-            if dist < 0.6: 
-                source_url = row['source_url'] if row['source_url'] else ""
-                # 💡 한글 자소 분리 방지 및 인코딩
-                normalized = unicodedata.normalize('NFC', source_url)
-                encoded = urllib.parse.quote(normalized)
-                
-                results.append({
-                    "content": row['original_content'], 
-                    "title": row['title'], 
-                    "url": f"{BASE_DOCS_URL}{encoded}" if source_url else "#"
-                })
+            source_url = row['source_url'] if row['source_url'] else ""
+            normalized = unicodedata.normalize('NFC', source_url)
+            encoded = urllib.parse.quote(normalized)
+            
+            results.append({
+                "content": row['original_content'], 
+                "title": row['title'], 
+                "url": f"{BASE_DOCS_URL}{encoded}" if source_url else "#"
+            })
         return results
     except Exception as err:
         print(f"❌ [DB Error] {err}")
@@ -132,10 +148,8 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
-    # 💡 정적 파일 서빙 로직 (운영 중 실시간 파일 조회용)
     def serve_static_file(self, file_path):
         try:
-            # URL 인코딩된 경로 해제 (한글 포함)
             decoded_filename = unquote(file_path)
             full_path = os.path.join(STORAGE_DIR, decoded_filename)
 
@@ -171,13 +185,11 @@ class RAGHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path)
         
-        # 💡 1. 파일 요청 처리 (/files/...)
         if parsed_path.path.startswith("/files/"):
-            file_path = parsed_path.path[7:] # '/files/' 이후 부분
+            file_path = parsed_path.path[7:]
             self.serve_static_file(file_path)
             return
 
-        # 2. 검색 요청 처리 (/search)
         if parsed_path.path == "/search":
             params = parse_qs(parsed_path.query)
             query = params.get('query', [''])[0]
@@ -197,7 +209,6 @@ class RAGHandler(BaseHTTPRequestHandler):
                 if search_results:
                     context_combined = "\n".join([f"### [데이터]: {r['content']}" for r in search_results])
                     
-                    # 💡 [논리적 추론 허용 프롬프트]로 수정
                     prompt = (
                         f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하되, "
                         f"직접적인 절차가 없더라도 데이터 내의 메뉴명, 버튼 이름 등을 활용해 논리적으로 추론하여 안내하세요.\n"
@@ -225,6 +236,9 @@ class RAGHandler(BaseHTTPRequestHandler):
                 self._send_sse({"error": str(e)}); self._send_done()
 
     def _save_feedback_to_db(self, query, answer):
+        """
+        💡 [피드백 저장 시 하이브리드 검색 컬럼 대응]
+        """
         combined_text = f"질문: {query}\n전문가 답변: {answer}"
         with embedding_lock:
             vector = embed_model.encode(combined_text).tolist()
@@ -234,19 +248,18 @@ class RAGHandler(BaseHTTPRequestHandler):
             conn = psycopg2.connect(**DB_CONFIG)
             register_vector(conn)
             cursor = conn.cursor()
+            # 💡 content_search_vector(tsvector)를 함께 저장
             sql = f"""
                 INSERT INTO {TABLE_NAME} 
-                (content_type, data_source, original_content, embedding, title) 
-                VALUES (%s, %s, %s, %s, %s)
+                (content_type, data_source, original_content, embedding, title, content_search_vector) 
+                VALUES (%s, %s, %s, %s, %s, to_tsvector('simple', %s))
             """
-            cursor.execute(sql, ('text', 'feedback', combined_text, vector, '검증된 답변'))
+            cursor.execute(sql, ('text', 'feedback', combined_text, vector, '검증된 답변', combined_text))
             conn.commit()
         finally:
             if conn: conn.close()
 
 if __name__ == "__main__":
-    # 서버 실행 (localhost:8000)
     server = ThreadingHTTPServer(('0.0.0.0', 8000), RAGHandler)
-    print(f"📡 PostgreSQL pgvector RAG Service 가동: http://localhost:8000")
-    print(f"📂 정적 파일 저장소: {STORAGE_DIR}")
+    print(f"📡 하이브리드 RAG Service 가동: http://localhost:8000")
     server.serve_forever()
