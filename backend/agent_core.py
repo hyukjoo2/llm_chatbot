@@ -40,11 +40,11 @@ DB_NAME = os.getenv("DB_NAME")
 
 # PostgreSQL 연결 정보
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "127.0.0.1"),
-    "port": int(os.getenv("DB_PORT", 5432)),
-    "user": os.getenv("DB_USER", "myuser"),
-    "password": os.getenv("DB_PASSWORD", "1234"),
-    "dbname": DB_NAME
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT")),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "dbname": os.getenv("DB_NAME")
 }
 
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
